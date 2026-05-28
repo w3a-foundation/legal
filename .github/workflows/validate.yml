@@ -1,0 +1,95 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate Markdown frontmatter
+        run: |
+          set -euo pipefail
+          npm install --no-save gray-matter@4 globby@14
+          node --input-type=module <<'EOF'
+          import matter from 'gray-matter';
+          import { globby } from 'globby';
+          import { readFileSync } from 'node:fs';
+
+          const files = await globby(['**/*.md', '!node_modules/**']);
+          let bad = 0;
+          for (const f of files) {
+            const raw = readFileSync(f, 'utf8');
+            if (!raw.startsWith('---')) continue; // no frontmatter, skip
+            try {
+              const parsed = matter(raw);
+              if (parsed.data && typeof parsed.data !== 'object') {
+                console.error('invalid frontmatter:', f);
+                bad++;
+              }
+            } catch (e) {
+              console.error('frontmatter parse error:', f, e.message);
+              bad++;
+            }
+          }
+          if (bad > 0) { console.error(`${bad} file(s) failed`); process.exit(1); }
+          console.log(`validated ${files.length} markdown file(s)`);
+          EOF
+
+      - name: Sanity-check SPA template renders
+        run: |
+          set -euo pipefail
+          # Every charter / MoU is a top-level Markdown doc that the SPA
+          # template renders verbatim. The sanity gate is: each .md file
+          # contains at least one ATX heading (#) within its first 50
+          # lines — anything that doesn't is either binary, empty, or
+          # not a Markdown document and should not have shipped.
+          shopt -s globstar nullglob
+          fail=0
+          for f in charters/**/*.md mou-templates/**/*.md; do
+            [ -f "$f" ] || continue
+            if ! head -n 50 "$f" | grep -qE '^#'; then
+              echo "no ATX heading in first 50 lines: $f"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Verify Charter version stamp
+        run: |
+          set -euo pipefail
+          # The Charter must carry a "Version: X.Y" line near the top.
+          # On a tag push, the tag (vX.Y or vX.Y.Z) must match.
+          CHARTER=charters/CHARTER.md
+          [ -f "$CHARTER" ] || { echo "missing $CHARTER"; exit 1; }
+          VERSION=$(grep -E '^\*\*Version:\*\*' "$CHARTER" | head -n1 | sed -E 's/.*Version:\*\*[[:space:]]+([^[:space:]]+).*/\1/')
+          if [ -z "${VERSION}" ]; then
+            echo "no **Version:** line in $CHARTER"
+            exit 1
+          fi
+          echo "Charter version: ${VERSION}"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [[ "${VERSION}" != "${TAG_VERSION}"* && "${TAG_VERSION}" != "${VERSION}"* ]]; then
+              echo "tag ${GITHUB_REF_NAME} does not match Charter version ${VERSION}"
+              exit 1
+            fi
+          fi
